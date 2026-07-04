@@ -1,0 +1,128 @@
+/*
+ * client.h - Client decoration, keyboard shortcuts inhibit, and server cleanup
+ *
+ * This module handles three responsibilities:
+ *
+ * XDG Decoration:
+ *
+ *   Wayland clients can request either client-side or server-side window
+ *   decorations. The p9wl compositor forces server-side decorations so
+ *   that it can draw window borders via the Plan 9 draw protocol.
+ *
+ *   When a client creates an xdg_toplevel_decoration object, the
+ *   handle_new_decoration() handler sets the mode to server-side.
+ *   This may need to be deferred until the surface is initialized.
+ *
+ *   Internal decoration_data struct tracks:
+ *     - decoration: the wlr_xdg_toplevel_decoration_v1 object
+ *     - destroy/request_mode/surface_commit: Wayland listeners
+ *     - mode_set: flag to avoid setting mode multiple times
+ *
+ * Keyboard Shortcuts Inhibit:
+ *
+ *   When a client enters fullscreen (e.g. YouTube video), it may request
+ *   that the compositor stop intercepting keyboard shortcuts and forward
+ *   all keys to the client. This allows the client to handle Escape etc.
+ *
+ *   handle_new_kb_inhibitor() activates the inhibitor. While active,
+ *   wl_input.c checks s->active_kb_inhibitor and skips compositor-level
+ *   key interception (popup Escape dismissal).
+ *
+ *   Wire up during server initialization:
+ *
+ *     s->kb_shortcuts_inhibit =
+ *         wlr_keyboard_shortcuts_inhibit_manager_v1_create(s->wl_display);
+ *     s->new_kb_shortcut_inhibitor.notify = handle_new_kb_inhibitor;
+ *     wl_signal_add(&s->kb_shortcuts_inhibit->events.new_inhibitor,
+ *                   &s->new_kb_shortcut_inhibitor);
+ *
+ * Server Cleanup:
+ *
+ *   server_cleanup() performs orderly shutdown of the compositor:
+ *
+ *     1. Signal threads to stop (s->running = 0)
+ *     2. Wake send thread via condition variable
+ *     3. Join all worker threads (mouse, keyboard, send)
+ *     4. Clean up virtual keyboard via wlr_keyboard_finish()
+ *     5. Log focus manager statistics via focus_manager_cleanup()
+ *     6. Free framebuffers (framebuf, prev_framebuf, send_buf[0/1])
+ *     7. Destroy synchronization primitives (mutex, condvar)
+ *     8. Disconnect all 9P connections (draw, mouse, kbd, wctl, snarf)
+ *     9. Close input queue pipe and destroy its mutex
+ *     10. Free TLS configuration strings
+ *
+ * Usage:
+ *
+ *   Wire up the decoration handler during server initialization:
+ *
+ *     server->new_decoration.notify = handle_new_decoration;
+ *     wl_signal_add(&decoration_mgr->events.new_toplevel_decoration,
+ *                   &server->new_decoration);
+ *
+ *   Call server_cleanup() during shutdown (or let toplevel_destroy()
+ *   call exit() which doesn't require explicit cleanup).
+ */
+
+#ifndef P9WL_CLIENT_H
+#define P9WL_CLIENT_H
+
+#include <stdbool.h>
+#include "../types.h"
+
+/* ============== Decoration Handling ============== */
+
+/*
+ * Handle new XDG toplevel decoration request.
+ *
+ * Forces server-side decoration mode. If the underlying XDG surface is
+ * not yet initialized (xdg->base->initialized is false), defers the mode
+ * setting by adding a surface commit listener that will retry on each
+ * commit until the surface is ready.
+ *
+ * Allocates internal decoration_data struct that is automatically freed
+ * when the decoration is destroyed.
+ *
+ * listener: wl_listener from server->new_decoration
+ * data:     wlr_xdg_toplevel_decoration_v1 pointer
+ */
+void handle_new_decoration(struct wl_listener *listener, void *data);
+
+/* ============== Keyboard Shortcuts Inhibit ============== */
+
+/*
+ * Handle new keyboard shortcuts inhibitor request.
+ *
+ * When a fullscreen client (e.g. a browser showing fullscreen video)
+ * requests keyboard shortcuts inhibition, this handler activates it
+ * so that all keys (including Escape) are forwarded to the client
+ * rather than being intercepted by the compositor.
+ *
+ * Only one inhibitor is active at a time; creating a new one
+ * deactivates any existing inhibitor.
+ *
+ * listener: wl_listener from server->new_kb_shortcut_inhibitor
+ * data:     wlr_keyboard_shortcuts_inhibitor_v1 pointer
+ */
+void handle_new_kb_inhibitor(struct wl_listener *listener, void *data);
+
+/* ============== Server Cleanup ============== */
+
+/*
+ * Clean up server resources during shutdown.
+ *
+ * Stops all worker threads, frees allocated memory, destroys
+ * synchronization primitives, and disconnects 9P connections.
+ *
+ * Thread shutdown sequence:
+ *   1. Sets s->running = 0
+ *   2. Signals send_cond to wake send thread
+ *   3. Joins mouse_thread, kbd_thread, send_thread
+ *
+ * This is typically not called explicitly since the compositor exits
+ * via exit() when the last toplevel is destroyed in toplevel_destroy().
+ *
+ * s: server state to clean up
+ */
+void server_cleanup(struct server *s);
+
+#endif /* P9WL_CLIENT_H */

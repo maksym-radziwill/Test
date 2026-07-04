@@ -1,0 +1,664 @@
+/*
+ * draw.c - Plan 9 draw device initialization and window management
+ *
+ * Manages connection to /dev/draw and window lookup/relookup.
+ */
+
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <time.h>
+#include <pthread.h>
+
+#include <wlr/util/log.h>
+
+#include "draw.h"
+#include "../p9/p9.h"
+#include "send.h"  /* For TILE_SIZE */
+
+#define DRAW_SCALE 1.0f
+
+/* Round up to nearest multiple of TILE_SIZE so every tile is a full 16×16.
+ * The buffer is slightly larger than the visible window; the invisible
+ * padding pixels are never displayed because Plan 9's draw device clips
+ * the copy-to-screen to the screen image's rectangle. */
+#define TILE_ALIGN_UP(x) (((x) + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE)
+
+/* Minimum usable dimension (at least a few tiles) */
+#define MIN_ALIGNED_DIM (TILE_SIZE * 4)
+
+/* Minimum border (pixels) to preserve on each side of the rio window.
+ * We inset by RIO_BORDER from the window edges so our content never
+ * overwrites rio's border decoration.  The copy-to-screen uses
+ * visible dimensions, leaving equal borders on all four sides. */
+#define RIO_BORDER 4
+
+/* ============== Window Management ============== */
+
+/* Re-lookup window after "unknown id" error.
+ * CRITICAL: When Plan 9 resizes/moves a window, it creates a NEW window
+ * with a NEW name (e.g., window.4.14 -> window.4.15). We must re-read
+ * /dev/winname to get the current name, then re-lookup with that name.
+ *
+ * All I/O uses the dedicated relookup connection (p9_relookup) which
+ * has its own socket, completely isolated from the send/drain threads
+ * on p9_draw.  This eliminates the stream desync that occurred when
+ * relookup and drain read from the same socket concurrently.
+ *
+ * The lookup uses a temporary image ID so the old screen_id stays
+ * valid throughout.  Only after 'n' succeeds do we free the old ID
+ * and promote the temp.  If all retries fail, screen_id is untouched
+ * and the send thread can keep drawing.
+ */
+int relookup_window(struct rio_window *rw) {
+    struct draw_state *draw = &rw->draw;
+    
+    /* Use the dedicated relookup connection.  Fall back to main
+     * connection if relookup init failed (legacy behavior). */
+    struct p9conn *p9 = draw->p9_relookup ? draw->p9_relookup : draw->p9;
+    uint32_t data_fid = draw->p9_relookup ? draw->relookup_data_fid : draw->drawdata_fid;
+    uint32_t ctl_fid  = draw->p9_relookup ? draw->relookup_ctl_fid  : draw->drawctl_fid;
+    uint32_t wn_fid   = draw->p9_relookup ? draw->relookup_winname_fid : draw->winname_fid;
+    
+    uint8_t vcmd[1] = { 'v' };
+    
+    /*
+     * Allocate a TEMPORARY image id for the 'n' lookup.  We must not
+     * free the old screen_id until we know the new name is valid,
+     * because the send thread may still be drawing to it.  If 'n'
+     * fails, the temp id was never allocated and the old screen_id
+     * remains usable.  On success we free the old one and promote.
+     */
+    int temp_id = draw->screen_id + 1;
+    /* Avoid collisions with other allocated image IDs */
+    if (temp_id == draw->image_id || temp_id == draw->opaque_id || temp_id == draw->delta_id)
+        temp_id = draw->screen_id + 100;
+    
+    /* Retry loop: re-read winname, 'n' lookup with temp id.
+     * Back off between attempts to let the rio server settle. */
+    static const int backoff_ms[] = { 0, 10, 25, 50, 100 };
+    int max_retries = (int)(sizeof(backoff_ms) / sizeof(backoff_ms[0]));
+    
+    for (int attempt = 0; attempt < max_retries; attempt++) {
+        if (attempt > 0) {
+            struct timespec ts = {
+                .tv_sec  = 0,
+                .tv_nsec = backoff_ms[attempt] * 1000000L
+            };
+            nanosleep(&ts, NULL);
+        }
+        
+        /* Re-read /dev/winname to get the CURRENT window name */
+        if (wn_fid) {
+            char newname[64] = {0};
+            int n = p9_read(p9, wn_fid, 0, sizeof(newname) - 1, (uint8_t*)newname);
+            if (n > 0) {
+                newname[n] = '\0';
+                if (n > 0 && newname[n-1] == '\n') newname[n-1] = '\0';
+                
+                if (strcmp(newname, draw->winname) != 0) {
+                    wlr_log(WLR_INFO, "Window name changed: '%s' -> '%s'", draw->winname, newname);
+                }
+                strncpy(draw->winname, newname, sizeof(draw->winname) - 1);
+                draw->winname[sizeof(draw->winname) - 1] = '\0';
+            } else {
+                wlr_log(WLR_ERROR, "relookup_window: failed to re-read /dev/winname (attempt %d/%d)",
+                        attempt + 1, max_retries);
+                continue;  /* retry */
+            }
+        }
+        
+        if (!draw->winname[0]) {
+            wlr_log(WLR_ERROR, "relookup_window: no window name");
+            return -1;
+        }
+        
+        wlr_log(WLR_INFO, "Re-looking up window '%s' (screen_id=%d, temp_id=%d, attempt %d)",
+                draw->winname, draw->screen_id, temp_id, attempt + 1);
+        
+        /* Bind the new window name to temp_id.
+         * The old screen_id stays live — don't free it yet. */
+        int wnamelen = strlen(draw->winname);
+        uint8_t ncmd[128];
+        int noff = 0;
+        
+        ncmd[noff++] = 'n';
+        PUT32(ncmd + noff, temp_id); noff += 4;
+        ncmd[noff++] = (uint8_t)wnamelen;
+        memcpy(ncmd + noff, draw->winname, wnamelen); noff += wnamelen;
+        
+        if (p9_write(p9, data_fid, 0, ncmd, noff) < 0) {
+            wlr_log(WLR_ERROR, "relookup_window: 'n' command failed for '%s' (attempt %d/%d)",
+                    draw->winname, attempt + 1, max_retries);
+            continue;  /* retry — old screen_id still valid */
+        }
+        p9_write(p9, data_fid, 0, vcmd, 1);
+        
+        /* 'n' succeeded — now safe to free old screen_id and promote */
+        uint8_t freecmd[5];
+        freecmd[0] = 'f';
+        PUT32(freecmd + 1, draw->screen_id);
+        p9_write(p9, data_fid, 0, freecmd, 5);
+        p9_write(p9, data_fid, 0, vcmd, 1);
+        
+        wlr_log(WLR_INFO, "relookup_window: promoted temp_id=%d, freed old screen_id=%d",
+                temp_id, draw->screen_id);
+        draw->screen_id = temp_id;
+        
+        goto lookup_ok;
+    }
+    
+    wlr_log(WLR_ERROR, "relookup_window: all %d attempts failed (screen_id=%d still valid)",
+            max_retries, draw->screen_id);
+    return -1;
+    
+lookup_ok:;
+    /* Re-read ctl to get current geometry */
+    uint8_t ctlbuf[256];
+    int n = p9_read(p9, ctl_fid, 0, sizeof(ctlbuf) - 1, ctlbuf);
+    if (n < 12*12) {
+        wlr_log(WLR_ERROR, "relookup_window: failed to read ctl");
+        return -1;
+    }
+    
+    ctlbuf[n] = '\0';
+    int rminx = atoi((char*)ctlbuf + 4*12);
+    int rminy = atoi((char*)ctlbuf + 5*12);
+    int rmaxx = atoi((char*)ctlbuf + 6*12);
+    int rmaxy = atoi((char*)ctlbuf + 7*12);
+    
+    /* Get actual window dimensions */
+    int actual_width = rmaxx - rminx;
+    int actual_height = rmaxy - rminy;
+    
+    /* Inset by RIO_BORDER to preserve rio's border, then pad up */
+    int vis_w = actual_width - 2 * RIO_BORDER;
+    int vis_h = actual_height - 2 * RIO_BORDER;
+    if (vis_w < MIN_ALIGNED_DIM) vis_w = MIN_ALIGNED_DIM;
+    if (vis_h < MIN_ALIGNED_DIM) vis_h = MIN_ALIGNED_DIM;
+    int new_width = TILE_ALIGN_UP(vis_w);
+    int new_height = TILE_ALIGN_UP(vis_h);
+    
+    if (new_width <= 0 || new_height <= 0 || new_width > 4096 || new_height > 4096) {
+        wlr_log(WLR_ERROR, "relookup_window: invalid dimensions %dx%d", new_width, new_height);
+        return -1;
+    }
+    
+    /* Content origin: inset from window edge */
+    draw->win_minx = rminx + RIO_BORDER;
+    draw->win_miny = rminy + RIO_BORDER;
+    draw->visible_width = vis_w;
+    draw->visible_height = vis_h;
+    
+    if (new_width != vis_w || new_height != vis_h) {
+        wlr_log(WLR_INFO, "relookup_window: visible %dx%d, padded %dx%d, border=%d",
+                vis_w, vis_h, new_width, new_height, RIO_BORDER);
+    }
+    
+    /* Check if dimensions changed */
+    if (new_width != draw->width || new_height != draw->height) {
+        wlr_log(WLR_INFO, "relookup_window: size changed from %dx%d to %dx%d",
+                draw->width, draw->height, new_width, new_height);
+        
+        /* Store new dimensions for main thread to handle */
+        rw->pending_width = new_width;
+        rw->pending_height = new_height;
+        rw->pending_visible_width = vis_w;
+        rw->pending_visible_height = vis_h;
+        rw->pending_minx = draw->win_minx;
+        rw->pending_miny = draw->win_miny;
+        snprintf(rw->pending_winname, sizeof(rw->pending_winname), "%s", draw->winname);
+        rw->resize_pending = 1;
+        
+        wlr_log(WLR_INFO, "relookup_window: resize pending %dx%d -> %dx%d, main thread will handle",
+                draw->width, draw->height, new_width, new_height);
+    } else {
+        /* Just position change, update now and force full redraw */
+        wlr_log(WLR_INFO, "Window position updated: '%s' at (%d,%d) %dx%d",
+                draw->winname, draw->win_minx, draw->win_miny, draw->width, draw->height);
+        rw->force_full_frame = 1;
+        rw->frame_dirty = 1;
+    }
+    
+    return 0;
+}
+
+/* Delete rio window (close to clean up) */
+void delete_rio_window(struct p9conn *p9) {
+    uint32_t wctl_fid = p9->next_fid++;
+    const char *wnames[1] = { "wctl" };
+    
+    if (p9_walk(p9, p9->root_fid, wctl_fid, 1, wnames) < 0) {
+        wlr_log(WLR_ERROR, "Failed to walk to /dev/wctl for delete");
+        return;
+    }
+    
+    if (p9_open(p9, wctl_fid, OWRITE, NULL) < 0) {
+        wlr_log(WLR_ERROR, "Failed to open /dev/wctl for delete");
+        return;
+    }
+    
+    const char *cmd = "delete";
+    wlr_log(WLR_INFO, "Deleting rio window");
+    p9_write(p9, wctl_fid, 0, (uint8_t*)cmd, strlen(cmd));
+}
+
+/*
+ * Open fids on the relookup connection for use by relookup_window().
+ *
+ * The relookup connection (p9_relookup) is a separate 9P session that
+ * accesses the same draw client's data and ctl files, plus /dev/winname.
+ * By keeping relookup I/O on its own connection, it never interferes
+ * with the send thread's writes or the drain thread's reads on p9_draw.
+ *
+ * Must be called after init_draw has established the draw client
+ * (we need client_id to walk to /dev/draw/N/data and /dev/draw/N/ctl).
+ */
+static int init_relookup_fids(struct rio_window *rw) {
+    struct p9conn *p9r = &rw->p9_relookup;
+    struct draw_state *draw = &rw->draw;
+    const char *wnames[3];
+    char id_str[32];
+    
+    draw->p9_relookup = p9r;
+    draw->relookup_draw_fid = p9r->next_fid++;
+    draw->relookup_data_fid = p9r->next_fid++;
+    draw->relookup_ctl_fid = p9r->next_fid++;
+    draw->relookup_winname_fid = p9r->next_fid++;
+    
+    /* Walk to /dev/draw */
+    wnames[0] = "draw";
+    if (p9_walk(p9r, p9r->root_fid, draw->relookup_draw_fid, 1, wnames) < 0) {
+        wlr_log(WLR_ERROR, "relookup: failed to walk to /dev/draw");
+        return -1;
+    }
+    
+    /* Walk to /dev/draw/<clientid>/data and open ORDWR */
+    snprintf(id_str, sizeof(id_str), "%d", draw->client_id);
+    wnames[0] = id_str;
+    wnames[1] = "data";
+    if (p9_walk(p9r, draw->relookup_draw_fid, draw->relookup_data_fid, 2, wnames) < 0) {
+        wlr_log(WLR_ERROR, "relookup: failed to walk to /dev/draw/%d/data", draw->client_id);
+        return -1;
+    }
+    if (p9_open(p9r, draw->relookup_data_fid, ORDWR, NULL) < 0) {
+        wlr_log(WLR_ERROR, "relookup: failed to open /dev/draw/%d/data", draw->client_id);
+        return -1;
+    }
+    
+    /* Walk to /dev/draw/<clientid>/ctl and open OREAD */
+    wnames[0] = id_str;
+    wnames[1] = "ctl";
+    if (p9_walk(p9r, draw->relookup_draw_fid, draw->relookup_ctl_fid, 2, wnames) < 0) {
+        wlr_log(WLR_ERROR, "relookup: failed to walk to /dev/draw/%d/ctl", draw->client_id);
+        return -1;
+    }
+    if (p9_open(p9r, draw->relookup_ctl_fid, OREAD, NULL) < 0) {
+        wlr_log(WLR_ERROR, "relookup: failed to open /dev/draw/%d/ctl", draw->client_id);
+        return -1;
+    }
+    
+    /* Walk to /dev/winname and open OREAD */
+    wnames[0] = "winname";
+    if (p9_walk(p9r, p9r->root_fid, draw->relookup_winname_fid, 1, wnames) < 0) {
+        wlr_log(WLR_ERROR, "relookup: failed to walk to /dev/winname");
+        return -1;
+    }
+    if (p9_open(p9r, draw->relookup_winname_fid, OREAD, NULL) < 0) {
+        wlr_log(WLR_ERROR, "relookup: failed to open /dev/winname");
+        return -1;
+    }
+    
+    wlr_log(WLR_INFO, "Relookup fids opened on separate connection (client %d)", draw->client_id);
+    return 0;
+}
+
+/* ============== Draw Initialization ============== */
+
+/*
+ * Thread wrapper for init_relookup_fids.
+ * Returns NULL on success, non-NULL on failure.
+ */
+static void *init_relookup_thread(void *arg) {
+    struct rio_window *rw = arg;
+    return init_relookup_fids(rw) < 0 ? (void *)1 : NULL;
+}
+
+int init_draw(struct rio_window *rw) {
+    struct p9conn *p9 = &rw->p9_draw;
+    struct draw_state *draw = &rw->draw;
+    const char *wnames[3];
+    char init_str[256];
+    int rminx, rminy, rmaxx, rmaxy;
+    int actual_width, actual_height;
+    
+    draw->p9 = p9;
+    draw->draw_fid = p9->next_fid++;
+    draw->drawnew_fid = p9->next_fid++;
+    draw->drawdata_fid = p9->next_fid++;
+    draw->win_minx = 0;
+    draw->win_miny = 0;
+    
+    /* Walk to /dev/draw */
+    wnames[0] = "draw";
+    if (p9_walk(p9, p9->root_fid, draw->draw_fid, 1, wnames) < 0) {
+        wlr_log(WLR_ERROR, "Failed to walk to /dev/draw");
+        return -1;
+    }
+    
+    /* Walk to /dev/draw/new */
+    wnames[0] = "new";
+    if (p9_walk(p9, draw->draw_fid, draw->drawnew_fid, 1, wnames) < 0) {
+        wlr_log(WLR_ERROR, "Failed to walk to /dev/draw/new");
+        return -1;
+    }
+    
+    /* Open /dev/draw/new */
+    if (p9_open(p9, draw->drawnew_fid, ORDWR, NULL) < 0) {
+        wlr_log(WLR_ERROR, "Failed to open /dev/draw/new");
+        return -1;
+    }
+    
+    /* Read client ID and screen info */
+    uint8_t buf[256];
+    int n = p9_read(p9, draw->drawnew_fid, 0, sizeof(buf) - 1, buf);
+    if (n < 12*12) {
+        wlr_log(WLR_ERROR, "draw/new read too short: got %d bytes", n);
+        return -1;
+    }
+    buf[n] = '\0';
+    wlr_log(WLR_DEBUG, "draw/new (%d bytes): %.144s", n, (char*)buf);
+    
+    /* Parse client ID from first 12-char field */
+    draw->client_id = atoi((char*)buf);
+    wlr_log(WLR_INFO, "Draw client ID: %d", draw->client_id);
+    
+    /*
+     * Start relookup fid init on a background thread NOW.
+     * It only needs client_id (set above) and uses the separate
+     * p9_relookup connection, so it runs fully in parallel with
+     * all remaining init_draw work on p9_draw.
+     */
+    pthread_t relookup_thread;
+    int relookup_started = 0;
+    if (pthread_create(&relookup_thread, NULL, init_relookup_thread, rw) == 0)
+        relookup_started = 1;
+    
+    /* Parse initial dimensions from fields 4-7 (R rectangle: minx, miny, maxx, maxy) */
+    rminx = atoi((char*)buf + 4*12);
+    rminy = atoi((char*)buf + 5*12);
+    rmaxx = atoi((char*)buf + 6*12);
+    rmaxy = atoi((char*)buf + 7*12);
+    actual_width = rmaxx - rminx;
+    actual_height = rmaxy - rminy;
+    
+    if (actual_width <= 0 || actual_height <= 0) {
+        wlr_log(WLR_ERROR, "Invalid screen dimensions: %dx%d", actual_width, actual_height);
+        goto fail_join_relookup;
+    }
+    
+    /* Inset by RIO_BORDER on each side to preserve rio's window border,
+     * then pad up to tile-aligned dimensions for the internal buffer. */
+    draw->visible_width = actual_width - 2 * RIO_BORDER;
+    draw->visible_height = actual_height - 2 * RIO_BORDER;
+    if (draw->visible_width < MIN_ALIGNED_DIM) draw->visible_width = MIN_ALIGNED_DIM;
+    if (draw->visible_height < MIN_ALIGNED_DIM) draw->visible_height = MIN_ALIGNED_DIM;
+    draw->width = TILE_ALIGN_UP(draw->visible_width);
+    draw->height = TILE_ALIGN_UP(draw->visible_height);
+    draw->win_minx = rminx + RIO_BORDER;
+    draw->win_miny = rminy + RIO_BORDER;
+    
+    wlr_log(WLR_INFO, "Screen: (%d,%d)-(%d,%d) = %dx%d -> visible %dx%d, padded %dx%d",
+            rminx, rminy, rmaxx, rmaxy, actual_width, actual_height,
+            draw->visible_width, draw->visible_height,
+            draw->width, draw->height);
+    
+    /* Walk to /dev/draw/<clientid>/data */
+    snprintf(init_str, sizeof(init_str), "%d", draw->client_id);
+    wnames[0] = init_str;
+    wnames[1] = "data";
+    if (p9_walk(p9, draw->draw_fid, draw->drawdata_fid, 2, wnames) < 0) {
+        wlr_log(WLR_ERROR, "Failed to walk to /dev/draw/%d/data", draw->client_id);
+        goto fail_join_relookup;
+    }
+    
+    uint32_t iounit;
+    if (p9_open(p9, draw->drawdata_fid, ORDWR, &iounit) < 0) {
+        wlr_log(WLR_ERROR, "Failed to open /dev/draw/%d/data", draw->client_id);
+        goto fail_join_relookup;
+    }
+    draw->iounit = iounit;
+    wlr_log(WLR_INFO, "Draw data fd opened (iounit=%u)", iounit);
+    
+    /* Walk to /dev/draw/<clientid>/ctl */
+    draw->drawctl_fid = p9->next_fid++;
+    wnames[0] = init_str;
+    wnames[1] = "ctl";
+    if (p9_walk(p9, draw->draw_fid, draw->drawctl_fid, 2, wnames) < 0) {
+        wlr_log(WLR_ERROR, "Failed to walk to /dev/draw/%d/ctl", draw->client_id);
+        goto fail_join_relookup;
+    }
+    
+    if (p9_open(p9, draw->drawctl_fid, OREAD, NULL) < 0) {
+        wlr_log(WLR_ERROR, "Failed to open /dev/draw/%d/ctl", draw->client_id);
+        goto fail_join_relookup;
+    }
+    
+    /* Read the window name from /dev/winname */
+    char winname[64] = {0};
+    draw->winname_fid = p9->next_fid++;
+    wnames[0] = "winname";
+    if (p9_walk(p9, p9->root_fid, draw->winname_fid, 1, wnames) == 0) {
+        if (p9_open(p9, draw->winname_fid, OREAD, NULL) == 0) {
+            n = p9_read(p9, draw->winname_fid, 0, sizeof(winname) - 1, (uint8_t*)winname);
+            if (n > 0) {
+                winname[n] = '\0';
+                if (n > 0 && winname[n-1] == '\n') winname[n-1] = '\0';
+                wlr_log(WLR_INFO, "Window name: '%s'", winname);
+            }
+        }
+    }
+    
+    /* Look up the window by name using 'n' command */
+    int screen_image_id = 1000;
+    if (winname[0]) {
+        int wnamelen = strlen(winname);
+        uint8_t ncmd[128];
+        int noff = 0;
+        
+        ncmd[noff++] = 'n';
+        PUT32(ncmd + noff, screen_image_id); noff += 4;
+        ncmd[noff++] = (uint8_t)wnamelen;
+        memcpy(ncmd + noff, winname, wnamelen); noff += wnamelen;
+        /* Append 'v' (flush) to the same write — saves one RTT */
+        ncmd[noff++] = 'v';
+        
+        wlr_log(WLR_DEBUG, "Looking up window: 'n' id=%d namelen=%d name='%s'", 
+                screen_image_id, wnamelen, winname);
+        
+        int written = p9_write(p9, draw->drawdata_fid, 0, ncmd, noff);
+        if (written < 0) {
+            wlr_log(WLR_ERROR, "Failed to lookup window '%s' - falling back to image 0", winname);
+            screen_image_id = 0;
+        } else {
+            wlr_log(WLR_INFO, "Sent 'n'+'v' command for window '%s' as image %d", winname, screen_image_id);
+            
+            /* Store window name and ID */
+            strncpy(draw->winname, winname, sizeof(draw->winname) - 1);
+            draw->winname[sizeof(draw->winname) - 1] = '\0';
+            draw->winimage_id = screen_image_id;
+            
+            /* Read ctl to get the window's rectangle */
+            uint8_t ctlbuf[256];
+            n = p9_read(p9, draw->drawctl_fid, 0, sizeof(ctlbuf) - 1, ctlbuf);
+            wlr_log(WLR_DEBUG, "ctl read returned %d bytes", n);
+            if (n >= 12*12) {
+                ctlbuf[n] = '\0';
+                wlr_log(WLR_INFO, "Window ctl (%d bytes): %.144s", n, (char*)ctlbuf);
+                
+                /* Parse fixed-width 12-char fields */
+                rminx = atoi((char*)ctlbuf + 4*12);
+                rminy = atoi((char*)ctlbuf + 5*12);
+                rmaxx = atoi((char*)ctlbuf + 6*12);
+                rmaxy = atoi((char*)ctlbuf + 7*12);
+                
+                wlr_log(WLR_INFO, "Window rect: (%d,%d)-(%d,%d)", 
+                        rminx, rminy, rmaxx, rmaxy);
+                
+                actual_width = rmaxx - rminx;
+                actual_height = rmaxy - rminy;
+                
+                /* Inset by RIO_BORDER to preserve rio's window border */
+                draw->visible_width = actual_width - 2 * RIO_BORDER;
+                draw->visible_height = actual_height - 2 * RIO_BORDER;
+                if (draw->visible_width < MIN_ALIGNED_DIM) draw->visible_width = MIN_ALIGNED_DIM;
+                if (draw->visible_height < MIN_ALIGNED_DIM) draw->visible_height = MIN_ALIGNED_DIM;
+                draw->width = TILE_ALIGN_UP(draw->visible_width);
+                draw->height = TILE_ALIGN_UP(draw->visible_height);
+                
+                /* Content origin: inset from window edge */
+                draw->win_minx = rminx + RIO_BORDER;
+                draw->win_miny = rminy + RIO_BORDER;
+                
+                int pad_w = draw->width - draw->visible_width;
+                int pad_h = draw->height - draw->visible_height;
+                
+                wlr_log(WLR_INFO, "Window: visible %dx%d, padded %dx%d (pad R=%d B=%d), border=%d",
+                        draw->visible_width, draw->visible_height,
+                        draw->width, draw->height,
+                        pad_w, pad_h, RIO_BORDER);
+            } else {
+                wlr_log(WLR_ERROR, "ctl read too short: %d bytes (need %d)", n, 12*12);
+                if (n > 0) {
+                    ctlbuf[n] = '\0';
+                    wlr_log(WLR_DEBUG, "ctl content: %s", (char*)ctlbuf);
+                }
+            }
+        }
+    } else {
+        wlr_log(WLR_ERROR, "No window name available, using image 0");
+        screen_image_id = 0;
+    }
+    
+    /* Store the screen image ID for drawing */
+    draw->screen_id = screen_image_id;
+    
+    /* Allocate memory image for framebuffer */
+    draw->image_id = 1;
+    
+    /* Compute logical dimensions for the source image.
+     * Physical dimensions: draw->visible_width x draw->visible_height
+     * Logical dimensions: physical / DRAW_SCALE, then padded to tile alignment
+     */
+    int logical_width = (int)(draw->visible_width / DRAW_SCALE + 0.5f);
+    int logical_height = (int)(draw->visible_height / DRAW_SCALE + 0.5f);
+    
+    /* Pad logical dimensions to tile alignment */
+    logical_width = TILE_ALIGN_UP(logical_width);
+    logical_height = TILE_ALIGN_UP(logical_height);
+    if (logical_width < MIN_ALIGNED_DIM) logical_width = MIN_ALIGNED_DIM;
+    if (logical_height < MIN_ALIGNED_DIM) logical_height = MIN_ALIGNED_DIM;
+    
+    /* Store logical dimensions for use by send.c */
+    draw->logical_width = logical_width;
+    draw->logical_height = logical_height;
+    draw->scale = DRAW_SCALE;
+    
+    /*
+     * Batch all three image allocations ('b' commands) into a single
+     * p9_write.  The draw device processes concatenated commands from
+     * a single write atomically.  This saves 2 round trips.
+     */
+    uint8_t imgbuf[256];
+    int off = 0;
+    
+    /* Framebuffer image (XRGB32) */
+    draw->image_id = 1;
+    imgbuf[off++] = 'b';
+    PUT32(imgbuf + off, draw->image_id); off += 4;
+    PUT32(imgbuf + off, 0); off += 4;
+    imgbuf[off++] = 0;
+    PUT32(imgbuf + off, 0x68081828); off += 4;      /* XRGB32 */
+    imgbuf[off++] = 0;
+    PUT32(imgbuf + off, 0); off += 4;
+    PUT32(imgbuf + off, 0); off += 4;
+    PUT32(imgbuf + off, logical_width); off += 4;
+    PUT32(imgbuf + off, logical_height); off += 4;
+    PUT32(imgbuf + off, 0); off += 4;
+    PUT32(imgbuf + off, 0); off += 4;
+    PUT32(imgbuf + off, logical_width); off += 4;
+    PUT32(imgbuf + off, logical_height); off += 4;
+    PUT32(imgbuf + off, 0xFF000000); off += 4;
+    
+    /* Opaque mask: 1x1 white replicated */
+    draw->opaque_id = 2;
+    imgbuf[off++] = 'b';
+    PUT32(imgbuf + off, draw->opaque_id); off += 4;
+    PUT32(imgbuf + off, 0); off += 4;
+    imgbuf[off++] = 0;
+    PUT32(imgbuf + off, 0x00000031); off += 4;      /* GREY1 */
+    imgbuf[off++] = 1;
+    PUT32(imgbuf + off, 0); off += 4;
+    PUT32(imgbuf + off, 0); off += 4;
+    PUT32(imgbuf + off, 1); off += 4;
+    PUT32(imgbuf + off, 1); off += 4;
+    PUT32(imgbuf + off, (uint32_t)-0x3FFFFFFF); off += 4;
+    PUT32(imgbuf + off, (uint32_t)-0x3FFFFFFF); off += 4;
+    PUT32(imgbuf + off, 0x3FFFFFFF); off += 4;
+    PUT32(imgbuf + off, 0x3FFFFFFF); off += 4;
+    PUT32(imgbuf + off, 0xFFFFFFFF); off += 4;
+    
+    /* Delta image (ARGB32) */
+    draw->delta_id = 5;
+    imgbuf[off++] = 'b';
+    PUT32(imgbuf + off, draw->delta_id); off += 4;
+    PUT32(imgbuf + off, 0); off += 4;
+    imgbuf[off++] = 0;
+    PUT32(imgbuf + off, 0x48081828); off += 4;      /* ARGB32 */
+    imgbuf[off++] = 0;
+    PUT32(imgbuf + off, 0); off += 4;
+    PUT32(imgbuf + off, 0); off += 4;
+    PUT32(imgbuf + off, draw->width); off += 4;
+    PUT32(imgbuf + off, draw->height); off += 4;
+    PUT32(imgbuf + off, 0); off += 4;
+    PUT32(imgbuf + off, 0); off += 4;
+    PUT32(imgbuf + off, draw->width); off += 4;
+    PUT32(imgbuf + off, draw->height); off += 4;
+    PUT32(imgbuf + off, 0x00000000); off += 4;
+    
+    int written = p9_write(p9, draw->drawdata_fid, 0, imgbuf, off);
+    if (written < 0) {
+        wlr_log(WLR_ERROR, "Failed to allocate draw images");
+        goto fail_join_relookup;
+    }
+    wlr_log(WLR_INFO, "Allocated images: fb=%d (%dx%d), mask=%d, delta=%d (%dx%d) [batched]",
+            draw->image_id, logical_width, logical_height,
+            draw->opaque_id, draw->delta_id, draw->width, draw->height);
+    
+    draw->xor_enabled = 0;
+    
+    /* Wait for relookup thread to finish */
+    if (relookup_started) {
+        void *retval;
+        pthread_join(relookup_thread, &retval);
+        if (retval != NULL) {
+            wlr_log(WLR_ERROR, "Failed to init relookup fids (non-fatal)");
+            draw->p9_relookup = NULL;
+        }
+    } else {
+        if (init_relookup_fids(rw) < 0) {
+            wlr_log(WLR_ERROR, "Failed to init relookup fids (non-fatal)");
+            draw->p9_relookup = NULL;
+        }
+    }
+    
+    return 0;
+
+fail_join_relookup:
+    if (relookup_started)
+        pthread_join(relookup_thread, NULL);
+    return -1;
+}

@@ -1,0 +1,178 @@
+/*
+ * popup.c - Popup lifecycle management
+ *
+ * Handles XDG popup creation, commit, and destruction.
+ * Focus logic is handled by focus_manager.c
+ */
+
+#include <stdlib.h>
+#include <wayland-server-core.h>
+#include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/types/wlr_scene.h>
+#include <wlr/types/wlr_seat.h>
+#include <wlr/types/wlr_output.h>
+#include <wlr/util/log.h>
+
+#include "popup.h"
+#include "../types.h"
+
+static void popup_destroy(struct wl_listener *l, void *d) {
+    struct popup_data *pd = wl_container_of(l, pd, destroy);
+    (void)d;
+    
+    struct server *s = pd->server;
+    
+    wlr_log(WLR_INFO, "Popup DESTROYED: surface=%p", pd->surface);
+    
+    focus_popup_unregister(&s->focus, pd);
+    
+    wl_list_remove(&pd->commit.link);
+    wl_list_remove(&pd->destroy.link);
+    if (!wl_list_empty(&pd->grab.link)) {
+        wl_list_remove(&pd->grab.link);
+    }
+    
+    /*
+     * Mark the parent rio window dirty so the area the popup vacated is
+     * re-rendered.  Without this, the framebuf keeps the now-destroyed
+     * popup's pixels until some other event (keypress, mouse motion,
+     * client commit) sets scene_dirty and re-runs output_frame.
+     *
+     * The "send_frame_done is sent but the actual area underneath the
+     * popup never gets pushed" symptom shows up most often as tooltips
+     * and dropdowns that "stick" on screen until the user wiggles
+     * something.
+     *
+     * We also set force_full_frame so the next send is a full re-send
+     * rather than a delta.  After a popup destroy, prev_framebuf still
+     * has the popup's pixels — using it for delta encoding would make
+     * the send thread compress against the popup-present state, then
+     * Plan 9 would XOR-decode against its own popup-absent state, and
+     * the resulting pixels would be garbled until the next full frame.
+     * Forcing a full re-send sidesteps that whole class of inconsistency
+     * at the cost of one extra-large frame.
+     */
+    struct rio_window *rw = pd->window ? pd->window : s->primary;
+    if (rw && rw->output) {
+        rw->scene_dirty = 1;
+        rw->force_full_frame = 1;
+        wlr_output_schedule_frame(rw->output);
+    }
+    
+    free(pd);
+}
+
+static void popup_commit(struct wl_listener *l, void *d) {
+    struct popup_data *pd = wl_container_of(l, pd, commit);
+    (void)d;
+    
+    struct wlr_xdg_popup *popup = pd->popup;
+    struct wlr_surface *surface = popup->base->surface;
+    struct server *s = pd->server;
+    struct rio_window *rw = pd->window ? pd->window : s->primary;
+    
+    if (popup->base->initial_commit) {
+        int logical_w = focus_phys_to_logical(rw->visible_width, s->scale);
+        int logical_h = focus_phys_to_logical(rw->visible_height, s->scale);
+        struct wlr_box box = {
+            .x = 0,
+            .y = 0,
+            .width = logical_w,
+            .height = logical_h,
+        };
+        wlr_xdg_popup_unconstrain_from_box(popup, &box);
+        pd->configured = 1;
+        wlr_log(WLR_INFO, "Popup initial commit: unconstrained to %dx%d", 
+                box.width, box.height);
+        return;
+    }
+    
+    if (!surface->mapped) return;
+    
+    pd->commit_count++;
+    bool has_buffer = wlr_surface_has_buffer(surface);
+    
+    if (has_buffer && !pd->mapped) {
+        pd->mapped = true;
+        wlr_log(WLR_INFO, "Popup MAPPED: surface=%p has_grab=%d", pd->surface, pd->has_grab);
+        focus_popup_mapped(&s->focus, pd);
+    } else if (!has_buffer && pd->mapped) {
+        pd->mapped = false;
+        wlr_log(WLR_INFO, "Popup UNMAPPED: surface=%p", pd->surface);
+        focus_popup_unmapped(&s->focus, pd);
+    }
+
+    rw->scene_dirty = 1;
+    wlr_output_schedule_frame(rw->output);
+}
+
+void new_popup(struct wl_listener *l, void *d) {
+    struct server *s = wl_container_of(l, s, new_xdg_popup);
+    struct wlr_xdg_popup *popup = d;
+    
+    wlr_log(WLR_INFO, "New XDG popup created, parent=%p", (void*)popup->parent);
+    
+    struct wlr_xdg_surface *parent = wlr_xdg_surface_try_from_wlr_surface(popup->parent);
+    if (!parent || !parent->data) {
+        wlr_log(WLR_ERROR, "Popup: invalid parent");
+        return;
+    }
+    
+    struct wlr_scene_tree *parent_tree = parent->data;
+    struct wlr_scene_tree *popup_tree = wlr_scene_xdg_surface_create(parent_tree, popup->base);
+    if (!popup_tree) {
+        wlr_log(WLR_ERROR, "Failed to create popup scene tree");
+        return;
+    }
+    popup->base->data = popup_tree;
+    
+    struct popup_data *pd = calloc(1, sizeof(*pd));
+    if (!pd) {
+        wlr_log(WLR_ERROR, "Failed to allocate popup_data");
+        return;
+    }
+    
+    pd->popup = popup;
+    pd->surface = popup->base->surface;
+    pd->scene_tree = popup_tree;
+    pd->server = s;
+    
+    /* Find which rio_window owns this popup by walking up to the root
+     * xdg_surface (which should be a toplevel) and matching it.  Cap
+     * the walk at 8 hops to match wayland/presentation.c's find_window;
+     * wlroots should validate parent chains, but a defensive bound is
+     * cheap and avoids any infinite-loop risk on malformed input. */
+    pd->window = s->primary;  /* default fallback */
+    struct wlr_xdg_surface *root = parent;
+    for (int hops = 0;
+         hops < 8 && root && root->role == WLR_XDG_SURFACE_ROLE_POPUP && root->popup;
+         hops++) {
+        root = wlr_xdg_surface_try_from_wlr_surface(root->popup->parent);
+    }
+    if (root) {
+        struct toplevel *tl;
+        wl_list_for_each(tl, &s->toplevels, link) {
+            if (tl->xdg && tl->xdg->base == root) {
+                pd->window = tl->window;
+                break;
+            }
+        }
+    }
+    
+    pd->configured = 0;
+    pd->commit_count = 0;
+    pd->has_grab = (popup->seat != NULL);
+    pd->mapped = false;
+    wl_list_init(&pd->grab.link);
+    wl_list_init(&pd->link);
+    
+    focus_popup_register(&s->focus, pd);
+    
+    pd->commit.notify = popup_commit;
+    wl_signal_add(&popup->base->surface->events.commit, &pd->commit);
+    
+    pd->destroy.notify = popup_destroy;
+    wl_signal_add(&popup->base->events.destroy, &pd->destroy);
+    
+    wlr_log(WLR_INFO, "Popup scene tree created (has_grab=%d)", pd->has_grab);
+}
